@@ -57,9 +57,9 @@ def get_db_transaction():
 
 
 def recalculate_post_rankings():
-    logger.info("🚀 PRODUCTION DECAY CRON - AGE-BASED + 100 posts/batch")
+    logger.info("🚀 PRODUCTION DECAY CRON - PRESERVES content_type_weight")
 
-    # STEP 1: Get ALL post_ids (194 posts = safe)
+    # STEP 1: Get ALL post_ids
     with get_db_transaction() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT post_id FROM newsfeed_post ORDER BY post_id ASC")
@@ -68,7 +68,7 @@ def recalculate_post_rankings():
     total_posts = len(all_post_ids)
     logger.info(f"📊 {total_posts} posts to process")
 
-    # STEP 2: Process EXACTLY 100 posts per batch
+    # STEP 2: Process 100 posts per batch
     total_processed = 0
     batch_num = 0
 
@@ -80,22 +80,172 @@ def recalculate_post_rankings():
         if not batch_ids:
             break
 
-        logger.info(
-            f"📦 Batch {batch_num}: {len(batch_ids)} posts (#{start_idx+1}-#{min(start_idx+CHUNK_SIZE, total_posts)})"
-        )
+        logger.info(f"📦 Batch {batch_num}: {len(batch_ids)} posts")
         processed = process_exact_batch(batch_ids)
         total_processed += processed
 
-    logger.info(
-        f"🎉 DECAY COMPLETE: {total_processed} posts processed in {batch_num} batches"
-    )
+    logger.info(f"🎉 DECAY COMPLETE: {total_processed} posts in {batch_num} batches")
 
 
 def process_exact_batch(post_ids):
-    """Process EXACTLY these post_ids with AGE-BASED DECAY"""
+    """Decay using FULL PostScore formula: ranking_score * affinity * content_weight * boost"""
     with get_db_transaction() as conn:
         with conn.cursor() as cur:
-            # Get metrics + date_posted for age decay
+            # Get ALL PostScore fields + fresh date_posted
+            cur.execute(
+                """
+                SELECT 
+                    ps.post_id,
+                    p.date_posted,
+                    COALESCE(ps.affinity_score, 1.0) as affinity_score,
+                    COALESCE(ps.content_type_weight, 1.0) as content_type_weight,
+                    COALESCE(ps.recent_update_boost, 1.0) as recent_update_boost,
+                    COALESCE(ps.likes_count, 0) as likes_count,
+                    COALESCE(ps.comments_count, 0) as comments_count,
+                    COALESCE(ps.shares_count, 0) as shares_count,
+                    COALESCE(ps.ranking_score, 1.0) as current_score
+                FROM newsfeed_post p
+                LEFT JOIN newsfeed_postscore ps ON ps.post_id = p.post_id
+                WHERE p.post_id = ANY(%s)
+                ORDER BY p.post_id
+            """,
+                (post_ids,),
+            )
+
+            rows = cur.fetchall()
+            now_utc = datetime.now(timezone.utc)
+            updates = []
+
+            for row in rows:
+                post_id = row["post_id"]
+
+                # ✅ USE ALL ORIGINAL PostScore VALUES
+                affinity_score = float(row.get("affinity_score", 1.0))
+                content_type_weight = float(row.get("content_type_weight", 1.0))
+                recent_update_boost = float(row.get("recent_update_boost", 1.0))
+                likes = int(row.get("likes_count", 0))
+                comments = int(row.get("comments_count", 0))
+                shares = int(row.get("shares_count", 0))
+
+                # AGE DECAY on base score
+                age_hours = max(
+                    0.1, (now_utc - row["date_posted"]).total_seconds() / 3600
+                )
+                decay_factor = 0.999**age_hours
+                current_score = float(row.get("current_score", 1.0))
+
+                # ✅ PROPER DECAY: Apply decay THEN multiply by ALL weights
+                decayed_base = current_score * decay_factor
+                engagement_boost = (comments * 3 + likes * 1 + shares * 5) * 0.0005
+                new_base_score = max(0.001, decayed_base + engagement_boost)
+
+                # FINAL SCORE using ALL original weights
+                new_score = (
+                    new_base_score
+                    * affinity_score
+                    * content_type_weight
+                    * recent_update_boost
+                )
+
+                updates.append((post_id, likes, comments, shares, new_score))
+
+                # Log sample to verify weights preserved
+                if len(updates) <= 2:
+                    logger.info(
+                        f"   {post_id[:8]}... "
+                        f"A={affinity_score:.2f} C={content_type_weight:.2f} "
+                        f"B={recent_update_boost:.2f} → {new_score:.4f}"
+                    )
+
+            # UPDATE ONLY counts + final ranking_score
+            execute_values(
+                cur,
+                """
+                UPDATE newsfeed_postscore 
+                SET 
+                    likes_count = excluded.likes_count,
+                    comments_count = excluded.comments_count,
+                    shares_count = excluded.shares_count,
+                    ranking_score = excluded.ranking_score
+                FROM (VALUES %s) AS excluded(post_id, likes_count, comments_count, shares_count, ranking_score)
+                WHERE newsfeed_postscore.post_id = excluded.post_id
+            """,
+                updates,
+            )
+
+            avg_score = sum(u[4] for u in updates) / len(updates)
+            logger.info(f"✅ {len(updates)} posts | avg score: {avg_score:.4f}")
+            return len(updates)
+
+    with get_db_transaction() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 
+                    p.post_id, p.date_posted,
+                    COALESCE(likes.likes_count, 0), 
+                    COALESCE(comments.comment_count, 0),
+                    COALESCE(shares.share_count, 0),
+                    COALESCE(ps.ranking_score, 1.0)
+                FROM newsfeed_post p
+                LEFT JOIN newsfeed_postscore ps ON ps.post_id = p.post_id
+                LEFT JOIN (SELECT post_id, COUNT(*) as likes_count FROM newsfeed_reaction WHERE post_id = ANY(%s) GROUP BY post_id) likes ON p.post_id = likes.post_id
+                LEFT JOIN (SELECT post_id, COUNT(*) as comment_count FROM newsfeed_comment WHERE post_id = ANY(%s) AND deleted_at IS NULL GROUP BY post_id) comments ON p.post_id = comments.post_id
+                LEFT JOIN (SELECT post_id, MAX(CASE WHEN count_type = 'share' THEN count END) as share_count FROM newsfeed_activitycount WHERE post_id = ANY(%s) GROUP BY post_id) shares ON p.post_id = shares.post_id
+                WHERE p.post_id = ANY(%s)
+            """,
+                (post_ids, post_ids, post_ids, post_ids),
+            )
+
+            rows = cur.fetchall()
+            now_utc = datetime.now(timezone.utc)
+            updates = []
+
+            for row in rows:
+                post_id = row["post_id"]
+                likes = int(row.get("likes_count", 0))
+                comments = int(row.get("comment_count", 0))
+                shares = int(row.get("share_count", 0))
+
+                age_hours = max(
+                    0.1, (now_utc - row["date_posted"]).total_seconds() / 3600
+                )
+                decay_factor = 0.999**age_hours
+                current_score = float(row.get("ranking_score", 1.0))
+                new_score = max(
+                    0.001,
+                    current_score * decay_factor
+                    + (comments * 3 + likes * 1 + shares * 5) * 0.0005,
+                )
+
+                # ✅ CORRECT ORDER: (post_id, likes_count, comments_count, shares_count, ranking_score)
+                updates.append((post_id, likes, comments, shares, new_score))
+
+            # ✅ FIXED SYNTAX - column order matches VALUES order
+            execute_values(
+                cur,
+                """
+                UPDATE newsfeed_postscore 
+                SET 
+                    likes_count = excluded.likes_count,
+                    comments_count = excluded.comments_count,
+                    shares_count = excluded.shares_count,
+                    ranking_score = excluded.ranking_score
+                FROM (VALUES %s) AS excluded(post_id, likes_count, comments_count, shares_count, ranking_score)
+                WHERE newsfeed_postscore.post_id = excluded.post_id
+            """,
+                updates,
+            )
+
+            logger.info(
+                f"✅ {len(updates)} posts updated - content_type_weight UNTOUCHED"
+            )
+            return len(updates)
+
+    """UPDATE ONLY counts + ranking_score - PRESERVE content_type_weight!"""
+    with get_db_transaction() as conn:
+        with conn.cursor() as cur:
+            # Get fresh metrics + current ranking_score
             cur.execute(
                 """
                 SELECT 
@@ -105,6 +255,7 @@ def process_exact_batch(post_ids):
                     COALESCE(shares.share_count, 0) as post_share_count,
                     COALESCE(ps.ranking_score, 1.0) as current_score
                 FROM newsfeed_post p
+                LEFT JOIN newsfeed_postscore ps ON ps.post_id = p.post_id
                 LEFT JOIN (
                     SELECT post_id, COUNT(*) as likes_count 
                     FROM newsfeed_reaction WHERE post_id = ANY(%s) GROUP BY post_id
@@ -117,7 +268,6 @@ def process_exact_batch(post_ids):
                     SELECT post_id, MAX(CASE WHEN count_type = 'share' THEN count END) as share_count
                     FROM newsfeed_activitycount WHERE post_id = ANY(%s) GROUP BY post_id
                 ) shares ON p.post_id = shares.post_id
-                LEFT JOIN newsfeed_postscore ps ON ps.post_id = p.post_id
                 WHERE p.post_id = ANY(%s)
                 ORDER BY p.post_id
             """,
@@ -125,80 +275,55 @@ def process_exact_batch(post_ids):
             )
 
             rows = cur.fetchall()
-            metrics = {row["post_id"]: row for row in rows}
 
-            # AGE-BASED DECAY CALCULATION
             now_utc = datetime.now(timezone.utc)
-            data = []
-            total_decay = 0
-            total_age = 0
+            updates = []
 
-            for post_id in post_ids:
-                row = metrics.get(post_id, {})
+            for row in rows:
+                post_id = row["post_id"]
 
-                # ✅ AGE DECAY: Older posts decay MORE
+                # Fresh counts
+                likes = int(row.get("post_likes_count", 0))
+                comments = int(row.get("post_comment_count", 0))
+                shares = int(row.get("post_share_count", 0))
+
+                # Age-based decay on ranking_score ONLY
                 date_posted = row.get("date_posted")
                 if date_posted:
                     age_hours = max(0.1, (now_utc - date_posted).total_seconds() / 3600)
-                    decay_factor = 0.999**age_hours  # 24h=0.98, 7d=0.93, 14d=0.86
-                    total_age += age_hours
+                    decay_factor = 0.999**age_hours
                 else:
                     decay_factor = 0.999
-                    age_hours = 1.0
 
                 current_score = float(row.get("current_score", 1.0))
-                likes = float(row.get("post_likes_count", 0))
-                comments = float(row.get("post_comment_count", 0))
-                shares = float(row.get("post_share_count", 0))
-
-                # FINAL SCORE: decayed_score + fresh engagement
                 decayed_score = current_score * decay_factor
                 engagement_boost = (comments * 3 + likes * 1 + shares * 5) * 0.0005
                 new_score = max(0.001, decayed_score + engagement_boost)
 
-                total_decay += (1 - decay_factor) * 100  # % decayed
+                # ONLY these 4 fields get updated
+                updates.append((likes, comments, shares, new_score, post_id))
 
-                data.append(
-                    (
-                        post_id,
-                        1.0,
-                        1.0,
-                        1.0,  # fixed weights
-                        int(likes),
-                        int(comments),
-                        int(shares),
-                        float(new_score),
-                    )
-                )
-
-            # Atomic batch upsert
+            # ✅ CRITICAL: UPDATE ONLY 4 fields - NO INSERT, NO content_type_weight override!
             execute_values(
                 cur,
                 """
-                INSERT INTO newsfeed_postscore 
-                (post_id, affinity_score, content_type_weight, recent_update_boost,
-                 likes_count, comments_count, shares_count, ranking_score)
-                VALUES %s 
-                ON CONFLICT (post_id) DO UPDATE SET
-                    affinity_score = EXCLUDED.affinity_score,
-                    content_type_weight = EXCLUDED.content_type_weight,
-                    recent_update_boost = EXCLUDED.recent_update_boost,
-                    likes_count = EXCLUDED.likes_count,
-                    comments_count = EXCLUDED.comments_count,
-                    shares_count = EXCLUDED.shares_count,
-                    ranking_score = EXCLUDED.ranking_score
+                UPDATE newsfeed_postscore 
+                SET 
+                    likes_count = excluded.likes_count,
+                    comments_count = excluded.comments_count,
+                    shares_count = excluded.shares_count,
+                    ranking_score = excluded.ranking_score
+                FROM (VALUES %s) AS excluded(post_id, likes_count, comments_count, shares_count, ranking_score)
+                WHERE newsfeed_postscore.post_id = excluded.post_id
             """,
-                data,
+                updates,
             )
 
-            avg_age = total_age / len(post_ids)
-            avg_decay_pct = total_decay / len(post_ids)
-            avg_score = sum(s[7] for s in data) / len(data)
-
+            avg_score = sum(u[3] for u in updates) / len(updates)
             logger.info(
-                f"   ✅ {len(post_ids)} posts | age: {avg_age:.1f}h | decay: {avg_decay_pct:.2f}% | score: {avg_score:.4f}"
+                f"   ✅ {len(updates)} posts | avg score: {avg_score:.4f} | content_type_weight PRESERVED"
             )
-            return len(post_ids)
+            return len(updates)
 
 
 if __name__ == "__main__":
@@ -212,14 +337,14 @@ if __name__ == "__main__":
         setup_logging()
 
     if args.test:
-        logger.info("🧪 TEST MODE - AGE-BASED DECAY")
+        logger.info("🧪 TEST MODE - DECAY ONLY (content_type_weight preserved)")
         start_time = datetime.now()
         recalculate_post_rankings()
         duration = (datetime.now() - start_time).total_seconds()
         logger.info(f"✅ Test complete in {duration:.1f}s")
         sys.exit(0)
 
-    # Production cron: Every 5 hours
+    # Production cron
     scheduler = BackgroundScheduler()
     scheduler.add_job(
         recalculate_post_rankings,
