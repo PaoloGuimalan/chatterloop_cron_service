@@ -34,149 +34,136 @@ DB_CONFIG = {
     "sslmode": "require",
     "application_name": "ranking-cron",
 }
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "5000"))
 
-
-def validate_env():
-    required = ["DB_NAME", "DB_USER", "DB_PASS", "DB_HOST"]
-    missing = [k for k in required if not os.getenv(k)]
-    if missing:
-        logger.error(f"Missing env vars: {missing}")
-        sys.exit(1)
-    logger.info(f"DB: {DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}")
+CHUNK_SIZE = 100
 
 
 @contextmanager
 def get_db_transaction():
     conn = None
     try:
-        logger.info("Connecting to database...")
         conn = psycopg2.connect(**DB_CONFIG, cursor_factory=RealDictCursor)
-        logger.info("Database connected!")
         conn.autocommit = False
         yield conn
         conn.commit()
     except Exception as e:
         if conn:
             conn.rollback()
-            logger.error(f"Rollback: {e}")
+            logger.error(f"🚨 ROLLBACK: {e}")
         raise
     finally:
         if conn:
             conn.close()
 
 
-def test_db_connection():
-    try:
-        with get_db_transaction() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1 as healthy")
-                result = cur.fetchone()
-                logger.info(f"DB healthy: {result}")
-    except Exception as e:
-        logger.error(f"DB connection failed: {e}")
-        raise
-
-
 def recalculate_post_rankings():
-    logger.info("🚀 Gradual decay ranking update...")
+    logger.info("🚀 PRODUCTION DECAY CRON - AGE-BASED + 100 posts/batch")
 
+    # STEP 1: Get ALL post_ids (194 posts = safe)
     with get_db_transaction() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) as total FROM newsfeed_post")
-            total_posts = cur.fetchone()["total"]
-            logger.info(f"📊 Processing {total_posts} posts")
+            cur.execute("SELECT post_id FROM newsfeed_post ORDER BY post_id ASC")
+            all_post_ids = [row["post_id"] for row in cur.fetchall()]
 
-    start = datetime.now()
+    total_posts = len(all_post_ids)
+    logger.info(f"📊 {total_posts} posts to process")
+
+    # STEP 2: Process EXACTLY 100 posts per batch
     total_processed = 0
-    offset = 0
+    batch_num = 0
 
-    while True:
-        try:
-            processed = process_chunk(offset)
-            if not processed:
-                break
-            total_processed += processed
-            offset += CHUNK_SIZE
-            logger.info(f"✅ {total_processed}/{total_posts}")
-        except Exception as e:
-            logger.error(f"❌ Chunk {offset//CHUNK_SIZE}: {e}")
-            offset += CHUNK_SIZE
+    while total_processed < total_posts:
+        batch_num += 1
+        start_idx = (batch_num - 1) * CHUNK_SIZE
+        batch_ids = all_post_ids[start_idx : start_idx + CHUNK_SIZE]
 
-    duration = (datetime.now() - start).total_seconds()
+        if not batch_ids:
+            break
+
+        logger.info(
+            f"📦 Batch {batch_num}: {len(batch_ids)} posts (#{start_idx+1}-#{min(start_idx+CHUNK_SIZE, total_posts)})"
+        )
+        processed = process_exact_batch(batch_ids)
+        total_processed += processed
+
     logger.info(
-        f"🎉 GRADUAL DECAY COMPLETE: {total_processed} posts in {duration:.1f}s"
+        f"🎉 DECAY COMPLETE: {total_processed} posts processed in {batch_num} batches"
     )
 
 
-def process_chunk(offset):
+def process_exact_batch(post_ids):
+    """Process EXACTLY these post_ids with AGE-BASED DECAY"""
     with get_db_transaction() as conn:
         with conn.cursor() as cur:
+            # Get metrics + date_posted for age decay
             cur.execute(
                 """
-                SELECT p.post_id, p.date_posted,
+                SELECT 
+                    p.post_id, p.date_posted,
                     COALESCE(likes.likes_count, 0) as post_likes_count,
                     COALESCE(comments.comment_count, 0) as post_comment_count,
                     COALESCE(shares.share_count, 0) as post_share_count,
                     COALESCE(ps.ranking_score, 1.0) as current_score
                 FROM newsfeed_post p
-                LEFT JOIN LATERAL (
-                    SELECT COUNT(*) as likes_count 
-                    FROM newsfeed_reaction r 
-                    WHERE r.post_id = p.post_id
-                ) likes ON true
-                LEFT JOIN LATERAL (
-                    SELECT COUNT(*) as comment_count 
-                    FROM newsfeed_comment c 
-                    WHERE c.post_id = p.post_id AND c.deleted_at IS NULL
-                ) comments ON true
-                LEFT JOIN LATERAL (
-                    SELECT MAX(CASE WHEN ac.count_type = 'share' THEN ac.count END) as share_count
-                    FROM newsfeed_activitycount ac 
-                    WHERE ac.post_id = p.post_id
-                ) shares ON true
+                LEFT JOIN (
+                    SELECT post_id, COUNT(*) as likes_count 
+                    FROM newsfeed_reaction WHERE post_id = ANY(%s) GROUP BY post_id
+                ) likes ON p.post_id = likes.post_id
+                LEFT JOIN (
+                    SELECT post_id, COUNT(*) as comment_count 
+                    FROM newsfeed_comment WHERE post_id = ANY(%s) AND deleted_at IS NULL GROUP BY post_id
+                ) comments ON p.post_id = comments.post_id
+                LEFT JOIN (
+                    SELECT post_id, MAX(CASE WHEN count_type = 'share' THEN count END) as share_count
+                    FROM newsfeed_activitycount WHERE post_id = ANY(%s) GROUP BY post_id
+                ) shares ON p.post_id = shares.post_id
                 LEFT JOIN newsfeed_postscore ps ON ps.post_id = p.post_id
-                ORDER BY p.post_id LIMIT %s OFFSET %s
+                WHERE p.post_id = ANY(%s)
+                ORDER BY p.post_id
             """,
-                (CHUNK_SIZE, offset),
+                (post_ids, post_ids, post_ids, post_ids),
             )
 
             rows = cur.fetchall()
-            if not rows:
-                return 0
+            metrics = {row["post_id"]: row for row in rows}
 
+            # AGE-BASED DECAY CALCULATION
             now_utc = datetime.now(timezone.utc)
             data = []
+            total_decay = 0
+            total_age = 0
 
-            for row in rows:
-                age_hours = max(
-                    0.1, (now_utc - row["date_posted"]).total_seconds() / 3600
-                )
-                current_score = float(row["current_score"])
+            for post_id in post_ids:
+                row = metrics.get(post_id, {})
 
-                # Calculate engagement CHANGE since last run (much smaller boost)
-                likes = float(row["post_likes_count"])
-                comments = float(row["post_comment_count"])
-                shares = float(row["post_share_count"])
-                total_engagement = comments * 3 + likes * 1 + shares * 5
+                # ✅ AGE DECAY: Older posts decay MORE
+                date_posted = row.get("date_posted")
+                if date_posted:
+                    age_hours = max(0.1, (now_utc - date_posted).total_seconds() / 3600)
+                    decay_factor = 0.999**age_hours  # 24h=0.98, 7d=0.93, 14d=0.86
+                    total_age += age_hours
+                else:
+                    decay_factor = 0.999
+                    age_hours = 1.0
 
-                # ✅ TRUE DECAY: Apply decay FIRST, then tiny engagement boost
-                decay_factor = 0.995**age_hours  # 0.5% decay per hour
+                current_score = float(row.get("current_score", 1.0))
+                likes = float(row.get("post_likes_count", 0))
+                comments = float(row.get("post_comment_count", 0))
+                shares = float(row.get("post_share_count", 0))
+
+                # FINAL SCORE: decayed_score + fresh engagement
                 decayed_score = current_score * decay_factor
+                engagement_boost = (comments * 3 + likes * 1 + shares * 5) * 0.0005
+                new_score = max(0.001, decayed_score + engagement_boost)
 
-                # TINY boost only for NEW engagement (0.1% of engagement)
-                engagement_boost = total_engagement * 0.001
-
-                # FINAL: Decayed score + tiny boost
-                new_score = decayed_score + engagement_boost
-                new_score = max(0.001, new_score)
+                total_decay += (1 - decay_factor) * 100  # % decayed
 
                 data.append(
                     (
-                        row["post_id"],
+                        post_id,
                         1.0,
-                        current_score * 0.99,
-                        1.0,  # Keep other fields stable
+                        1.0,
+                        1.0,  # fixed weights
                         int(likes),
                         int(comments),
                         int(shares),
@@ -184,6 +171,7 @@ def process_chunk(offset):
                     )
                 )
 
+            # Atomic batch upsert
             execute_values(
                 cur,
                 """
@@ -203,41 +191,47 @@ def process_chunk(offset):
                 data,
             )
 
-            before = float(rows[0]["current_score"]) if rows else 0
-            after = data[0][7] if data else 0
+            avg_age = total_age / len(post_ids)
+            avg_decay_pct = total_decay / len(post_ids)
+            avg_score = sum(s[7] for s in data) / len(data)
+
             logger.info(
-                f"✅ {len(rows)} posts (sample: {before:.3f} → {after:.3f} {'↓' if after < before else '↑'})"
+                f"   ✅ {len(post_ids)} posts | age: {avg_age:.1f}h | decay: {avg_decay_pct:.2f}% | score: {avg_score:.4f}"
             )
-            return len(rows)
+            return len(post_ids)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Newsfeed Gradual Decay Ranking")
+    parser = argparse.ArgumentParser(description="Post Ranking Decay Cron")
     parser.add_argument("--test", action="store_true", help="Test single run")
+    parser.add_argument("--debug", action="store_true", help="Debug logging")
     args = parser.parse_args()
 
-    validate_env()
-    test_db_connection()
+    if args.debug:
+        os.environ["LOG_LEVEL"] = "DEBUG"
+        setup_logging()
 
     if args.test:
-        logger.info("🧪 TEST MODE - Gradual decay")
+        logger.info("🧪 TEST MODE - AGE-BASED DECAY")
+        start_time = datetime.now()
         recalculate_post_rankings()
-        logger.info("✅ Test complete!")
+        duration = (datetime.now() - start_time).total_seconds()
+        logger.info(f"✅ Test complete in {duration:.1f}s")
         sys.exit(0)
 
+    # Production cron: Every 5 hours
     scheduler = BackgroundScheduler()
     scheduler.add_job(
         recalculate_post_rankings,
         CronTrigger(hour="*/5"),
-        id="decay_ranking",
+        id="post_decay_cron",
         max_instances=1,
-        coalesce=True,
     )
     scheduler.start()
-    logger.info("⏰ GRADUAL DECAY CRON active (every 5h)")
+    logger.info("⏰ PRODUCTION CRON STARTED - Every 5h")
 
     def shutdown(signum=None, frame=None):
-        logger.info("🛑 Shutting down...")
+        logger.info("🛑 Graceful shutdown...")
         scheduler.shutdown()
         sys.exit(0)
 
