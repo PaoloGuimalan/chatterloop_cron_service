@@ -96,45 +96,33 @@ def process_exact_batch(post_ids):
                 """
                 SELECT 
                     p.post_id, p.date_posted,
-                    COALESCE(likes.likes_count, 0) as post_likes,
-                    COALESCE(comments.comment_count, 0) as post_comments,
-                    COALESCE(shares.share_count, 0) as post_shares,
+                    COALESCE(ps.likes_count, 0) as likes,
+                    COALESCE(ps.comments_count, 0) as comments,
+                    COALESCE(ps.shares_count, 0) as shares,
                     COALESCE(ps.ranking_score, 1.0) as current_score,
                     COALESCE(ps.content_type_weight, 1.0) as content_type_weight,
                     COALESCE(ps.recent_update_boost, 1.0) as recent_update_boost,
-                    COALESCE(ps.affinity_score, 1.0) as affinity_score
+                    COALESCE(ps.affinity_score, 1) as affinity_score
                 FROM newsfeed_post p
-                LEFT JOIN newsfeed_postscore ps ON ps.post_id = p.post_id
-                LEFT JOIN (
-                    SELECT post_id, COUNT(*) as likes_count 
-                    FROM newsfeed_reaction WHERE post_id = ANY(%s) GROUP BY post_id
-                ) likes ON p.post_id = likes.post_id
-                LEFT JOIN (
-                    SELECT post_id, COUNT(*) as comment_count 
-                    FROM newsfeed_comment WHERE post_id = ANY(%s) AND deleted_at IS NULL GROUP BY post_id
-                ) comments ON p.post_id = comments.post_id
-                LEFT JOIN (
-                    SELECT post_id, MAX(CASE WHEN count_type = 'share' THEN count END) as share_count
-                    FROM newsfeed_activitycount WHERE post_id = ANY(%s) GROUP BY post_id
-                ) shares ON p.post_id = shares.post_id
+                JOIN newsfeed_postscore ps ON ps.post_id = p.post_id
                 WHERE p.post_id = ANY(%s)
                 ORDER BY p.post_id
-            """,
-                (post_ids, post_ids, post_ids, post_ids),
+                """,
+                (post_ids,),
             )
 
-            rows = cur.fetchall()
+            # rows = cur.fetchall()
 
             now_utc = datetime.now(timezone.utc)
             updates = []
 
-            for row in rows:
+            for row in cur.fetchall():
                 post_id = row["post_id"]
 
                 # Fresh engagement counts
-                likes = int(row["post_likes"])
-                comments = int(row["post_comments"])
-                shares = int(row["post_shares"])
+                likes = int(row["likes"])
+                comments = int(row["comments"])
+                shares = int(row["shares"])
 
                 # Preserve original weights
                 content_weight = float(row["content_type_weight"])
