@@ -196,41 +196,50 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true", help="Debug logging")
     args = parser.parse_args()
 
-    if args.debug:
-        os.environ["LOG_LEVEL"] = "DEBUG"
-        setup_logging()
+    # if args.debug:
+    #     os.environ["LOG_LEVEL"] = "DEBUG"
+    #     setup_logging()
+
+    # if args.test:
+    #     logger.info("🧪 TEST MODE - Single decay run (content_type_weight preserved)")
+    #     start_time = datetime.now()
+    #     recalculate_post_rankings()
+    #     duration = (datetime.now() - start_time).total_seconds()
+    #     logger.info(f"✅ Test complete in {duration:.1f}s")
+    #     sys.exit(0)
+
+    # # Production cron - every 5 hours
+    # scheduler = BackgroundScheduler()
+    # scheduler.add_job(
+    #     recalculate_post_rankings,
+    #     CronTrigger(hour=os.getenv("CRON_HOURS"), minute=os.getenv("CRON_MINUTES")),
+    #     id="post_decay_cron",
+    #     max_instances=1,
+    # )
+    # scheduler.start()
+    # logger.info("⏰ PRODUCTION CRON STARTED - Every 5 hours")
+
+    # def shutdown(signum=None, frame=None):
+    #     logger.info("🛑 Graceful shutdown...")
+    #     scheduler.shutdown()
+    #     sys.exit(0)
+
+    # signal.signal(signal.SIGTERM, shutdown)
+    # signal.signal(signal.SIGINT, shutdown)
+
+    # try:
+    #     while True:
+    #         import time
+
+    #         time.sleep(10)
+    # except KeyboardInterrupt:
+    #     shutdown()
 
     if args.test:
-        logger.info("🧪 TEST MODE - Single decay run (content_type_weight preserved)")
-        start_time = datetime.now()
-        recalculate_post_rankings()
-        duration = (datetime.now() - start_time).total_seconds()
-        logger.info(f"✅ Test complete in {duration:.1f}s")
-        sys.exit(0)
+        logger.info("🧪 TEST MODE")
 
-    # Production cron - every 5 hours
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(
-        recalculate_post_rankings,
-        CronTrigger(hour=os.getenv("CRON_HOURS"), minute=os.getenv("CRON_MINUTES")),
-        id="post_decay_cron",
-        max_instances=1,
-    )
-    scheduler.start()
-    logger.info("⏰ PRODUCTION CRON STARTED - Every 5 hours")
-
-    def shutdown(signum=None, frame=None):
-        logger.info("🛑 Graceful shutdown...")
-        scheduler.shutdown()
-        sys.exit(0)
-
-    signal.signal(signal.SIGTERM, shutdown)
-    signal.signal(signal.SIGINT, shutdown)
-
-    try:
-        while True:
-            import time
-
-            time.sleep(10)
-    except KeyboardInterrupt:
-        shutdown()
+    # SINGLE EXECUTION - No scheduler, no infinite loop
+    logger.info("🚀 SINGLE RUN - Post ranking decay")
+    recalculate_post_rankings()
+    logger.info("✅ COMPLETE - Container will exit normally")
+    sys.exit(0)
