@@ -140,7 +140,7 @@ def process_exact_batch(post_ids):
                 content_weight = float(row["content_type_weight"])
                 update_boost = float(row["recent_update_boost"])
 
-                #formula
+                # formula
                 age_hours = (now_utc - row["date_posted"]).total_seconds() / 3600
                 affinity_score = float(row["affinity_score"])
                 content_type_weight = float(row["content_type_weight"])
@@ -151,7 +151,10 @@ def process_exact_batch(post_ids):
                 base_engagement = 1
 
                 weighted_engagement = (
-                    comments_count * 3 + likes_count * 1 + shares_count * 5 + base_engagement
+                    comments_count * 3
+                    + likes_count * 1
+                    + shares_count * 5
+                    + base_engagement
                 )
                 decay_factor = (age_hours + 1) ** 0.5
                 ranking_score = (
@@ -198,6 +201,7 @@ def process_exact_batch(post_ids):
             logger.info(f"✅ {len(updates)} posts | avg score: {avg_score:.4f}")
             return len(updates)
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Post Ranking Decay Cron")
     parser.add_argument("--test", action="store_true", help="Test single run")
@@ -220,7 +224,7 @@ if __name__ == "__main__":
     scheduler = BackgroundScheduler()
     scheduler.add_job(
         recalculate_post_rankings,
-        CronTrigger(hour="*/5"),
+        CronTrigger(hour=os.getenv("CRON_HOURS"), minute=os.getenv("CRON_MINUTES")),
         id="post_decay_cron",
         max_instances=1,
     )
