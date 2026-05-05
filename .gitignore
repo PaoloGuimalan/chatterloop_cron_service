@@ -3,3 +3,5 @@ ranking_cron.log
 __pycache__/
 *.pyc
 .venv
+# Cassandra 
+secure-connect-chatterloop.zip
