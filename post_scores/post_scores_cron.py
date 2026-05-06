@@ -8,7 +8,7 @@ from psycopg2.extras import RealDictCursor, execute_values
 from dotenv import load_dotenv
 from contextlib import contextmanager
 import argparse
-import uuid
+import redis
 from cassandra.cluster import Cluster
 from cassandra.auth import PlainTextAuthProvider
 from cassandra.concurrent import execute_concurrent_with_args
@@ -63,6 +63,19 @@ INSERT_STMT = session.prepare(
 )
 
 # END: CASSANDRA SETUP
+
+# REDIS SETUP
+
+redis_client = redis.Redis(
+    host=os.getenv("REDIS_HOST", "localhost"),
+    port=int(os.getenv("REDIS_PORT", 6379)),
+    username=os.getenv("REDIS_USERNAME"),
+    password=os.getenv("REDIS_PASSWORD"),
+    db=0,
+    decode_responses=True,
+)
+
+# END: REDIS SETUP
 
 
 @contextmanager
@@ -157,6 +170,7 @@ def process_exact_batch(post_ids):
 
             cass_deletes = []
             cass_inserts = []
+            locked_keys = []
 
             for row in rows:
                 post_id = row["post_id"]
@@ -216,6 +230,16 @@ def process_exact_batch(post_ids):
                 author_id = str(row["author_id"])
                 old_index = cass_lookup.get(pid_str)
 
+                post_lock_key = f"active_ranking_update_{pid_str}"
+
+                # Attempt to lock
+                if not redis_client.set(post_lock_key, "locked", ex=30, nx=True):
+                    logger.info(f"  Skipping {pid_str[:8]}: Being updated elsewhere.")
+                    continue
+
+                # Add to our "to be unlocked later" list
+                locked_keys.append(post_lock_key)
+
                 # Significance Filter: only sync if change > 1% (prevents tombstone bloat)
                 if not old_index or abs(ranking_score - old_index.ranking_score) > (
                     old_index.ranking_score * 0.01
@@ -237,10 +261,15 @@ def process_exact_batch(post_ids):
                 updates.append((post_id, ranking_score, 1))
 
             # --- EXECUTE CASSANDRA SYNC ---
-            if cass_deletes:
-                execute_concurrent_with_args(session, DELETE_STMT, cass_deletes)
-            if cass_inserts:
-                execute_concurrent_with_args(session, INSERT_STMT, cass_inserts)
+            try:
+                if cass_deletes:
+                    execute_concurrent_with_args(session, DELETE_STMT, cass_deletes)
+                if cass_inserts:
+                    execute_concurrent_with_args(session, INSERT_STMT, cass_inserts)
+            finally:
+                # UNLOCK ALL at once after the database work is actually done
+                if locked_keys:
+                    redis_client.delete(*locked_keys)
 
             # Atomic batch update - ONLY specified fields
             execute_values(
