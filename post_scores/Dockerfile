@@ -5,7 +5,7 @@ RUN apt-get update && apt-get install -y postgresql-client && rm -rf /var/lib/ap
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY .env* post_scores_cron.py ./
+COPY .env* post_scores_cron.py secure-connect-chatterloop.zip ./
 
 # ✅ Fix: Use shell form to pass arguments
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \

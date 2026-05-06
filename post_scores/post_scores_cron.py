@@ -8,6 +8,10 @@ from psycopg2.extras import RealDictCursor, execute_values
 from dotenv import load_dotenv
 from contextlib import contextmanager
 import argparse
+import uuid
+from cassandra.cluster import Cluster
+from cassandra.auth import PlainTextAuthProvider
+from cassandra.concurrent import execute_concurrent_with_args
 
 load_dotenv()
 os.environ["PYTHONUNBUFFERED"] = "1"
@@ -36,6 +40,29 @@ DB_CONFIG = {
 }
 
 CHUNK_SIZE = 100
+
+# CASSANDRA SETUP
+
+auth_provider = PlainTextAuthProvider(
+    os.getenv("CASSANDRA_DB_USERNAME"), os.getenv("CASSANDRA_DB_PASSWORD")
+)
+cluster = Cluster(
+    cloud={"secure_connect_bundle": os.getenv("CASSANDRA_DB_BUNDLE")},
+    auth_provider=auth_provider,
+)
+session = cluster.connect(os.getenv("CASSANDRA_DB_KEYSPACE"))
+
+SELECT_STMT = session.prepare(
+    "SELECT bucket, ranking_score, latest_activity, post_id FROM newsfeed_index WHERE post_id = ? ALLOW FILTERING"
+)
+DELETE_STMT = session.prepare(
+    "DELETE FROM newsfeed_index WHERE bucket=? AND ranking_score=? AND latest_activity=? AND post_id=?"
+)
+INSERT_STMT = session.prepare(
+    "INSERT INTO newsfeed_index (bucket, ranking_score, latest_activity, post_id, author_id) VALUES (?, ?, ?, ?, ?)"
+)
+
+# END: CASSANDRA SETUP
 
 
 @contextmanager
@@ -96,6 +123,7 @@ def process_exact_batch(post_ids):
                 """
                 SELECT 
                     p.post_id, p.date_posted,
+                    COALESCE(p.author_realm_id, p.user_id) as author_id,
                     COALESCE(ps.likes_count, 0) as likes,
                     COALESCE(ps.comments_count, 0) as comments,
                     COALESCE(ps.shares_count, 0) as shares,
@@ -111,12 +139,26 @@ def process_exact_batch(post_ids):
                 (post_ids,),
             )
 
-            # rows = cur.fetchall()
+            rows = cur.fetchall()
 
             now_utc = datetime.now(timezone.utc)
             updates = []
 
-            for row in cur.fetchall():
+            # --- CASSANDRA PRE-FETCH ---
+            # Get old keys for all 100 posts at once to avoid N+1
+            cass_results = execute_concurrent_with_args(
+                session, SELECT_STMT, [[str(r["post_id"])] for r in rows]
+            )
+            cass_lookup = {
+                r.one().post_id: r.one()
+                for success, r in cass_results
+                if success and r.one()
+            }
+
+            cass_deletes = []
+            cass_inserts = []
+
+            for row in rows:
                 post_id = row["post_id"]
 
                 # Fresh engagement counts
@@ -168,6 +210,37 @@ def process_exact_batch(post_ids):
                         f"D={decay_factor:.3f} E={update_boost:.4f} "
                         f"W={weighted_engagement:.2f} → {ranking_score:.4f}"
                     )
+
+                # --- CASSANDRA SYNC LOGIC ---
+                pid_str = str(row["post_id"])
+                author_id = str(row["author_id"])
+                old_index = cass_lookup.get(pid_str)
+
+                # Significance Filter: only sync if change > 1% (prevents tombstone bloat)
+                if not old_index or abs(ranking_score - old_index.ranking_score) > (
+                    old_index.ranking_score * 0.01
+                ):
+                    if old_index:
+                        cass_deletes.append(
+                            (
+                                old_index.bucket,
+                                old_index.ranking_score,
+                                old_index.latest_activity,
+                                old_index.post_id,
+                            )
+                        )
+
+                    cass_inserts.append(
+                        (author_id, ranking_score, now_utc, pid_str, author_id)
+                    )
+
+                updates.append((post_id, ranking_score, 1))
+
+            # --- EXECUTE CASSANDRA SYNC ---
+            if cass_deletes:
+                execute_concurrent_with_args(session, DELETE_STMT, cass_deletes)
+            if cass_inserts:
+                execute_concurrent_with_args(session, INSERT_STMT, cass_inserts)
 
             # Atomic batch update - ONLY specified fields
             execute_values(
