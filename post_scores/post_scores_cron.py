@@ -9,8 +9,9 @@ from dotenv import load_dotenv
 from contextlib import contextmanager
 import argparse
 import redis
-from cassandra.cluster import Cluster
+from cassandra.cluster import Cluster, ExecutionProfile, EXEC_PROFILE_DEFAULT
 from cassandra.auth import PlainTextAuthProvider
+from cassandra.policies import DCAwareRoundRobinPolicy
 from cassandra.concurrent import execute_concurrent_with_args
 
 load_dotenv()
@@ -42,6 +43,11 @@ DB_CONFIG = {
 CHUNK_SIZE = 100
 
 # CASSANDRA SETUP
+lb_policy = DCAwareRoundRobinPolicy(local_dc="us-east-2")
+
+profile = ExecutionProfile(
+    load_balancing_policy=lb_policy,
+)
 
 auth_provider = PlainTextAuthProvider(
     os.getenv("CASSANDRA_DB_USERNAME"), os.getenv("CASSANDRA_DB_PASSWORD")
@@ -49,6 +55,8 @@ auth_provider = PlainTextAuthProvider(
 cluster = Cluster(
     cloud={"secure_connect_bundle": os.getenv("CASSANDRA_DB_BUNDLE")},
     auth_provider=auth_provider,
+    protocol_version=4,
+    execution_profiles={EXEC_PROFILE_DEFAULT: profile},
 )
 session = cluster.connect(os.getenv("CASSANDRA_DB_KEYSPACE"))
 
@@ -230,7 +238,7 @@ def process_exact_batch(post_ids):
                 author_id = str(row["author_id"])
                 old_index = cass_lookup.get(pid_str)
 
-                post_lock_key = f"active_ranking_update_{pid_str}"
+                post_lock_key = f"chatterloop:active_ranking_update_{pid_str}"
 
                 # Attempt to lock
                 if not redis_client.set(post_lock_key, "locked", ex=30, nx=True):
@@ -240,23 +248,19 @@ def process_exact_batch(post_ids):
                 # Add to our "to be unlocked later" list
                 locked_keys.append(post_lock_key)
 
-                # Significance Filter: only sync if change > 1% (prevents tombstone bloat)
-                if not old_index or abs(ranking_score - old_index.ranking_score) > (
-                    old_index.ranking_score * 0.01
-                ):
-                    if old_index:
-                        cass_deletes.append(
-                            (
-                                old_index.bucket,
-                                old_index.ranking_score,
-                                old_index.latest_activity,
-                                old_index.post_id,
-                            )
+                if old_index:
+                    cass_deletes.append(
+                        (
+                            old_index.bucket,
+                            old_index.ranking_score,
+                            old_index.latest_activity,
+                            old_index.post_id,
                         )
-
-                    cass_inserts.append(
-                        (author_id, ranking_score, now_utc, pid_str, author_id)
                     )
+
+                cass_inserts.append(
+                    (author_id, ranking_score, now_utc, pid_str, author_id)
+                )
 
                 updates.append((post_id, ranking_score, 1))
 
