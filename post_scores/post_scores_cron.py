@@ -8,11 +8,12 @@ from psycopg2.extras import RealDictCursor, execute_values
 from dotenv import load_dotenv
 from contextlib import contextmanager
 import argparse
-import redis
-from cassandra.cluster import Cluster, ExecutionProfile, EXEC_PROFILE_DEFAULT
-from cassandra.auth import PlainTextAuthProvider
-from cassandra.policies import DCAwareRoundRobinPolicy
-from cassandra.concurrent import execute_concurrent_with_args
+
+# import redis
+# from cassandra.cluster import Cluster, ExecutionProfile, EXEC_PROFILE_DEFAULT
+# from cassandra.auth import PlainTextAuthProvider
+# from cassandra.policies import DCAwareRoundRobinPolicy
+# from cassandra.concurrent import execute_concurrent_with_args
 
 load_dotenv()
 os.environ["PYTHONUNBUFFERED"] = "1"
@@ -43,45 +44,45 @@ DB_CONFIG = {
 CHUNK_SIZE = 100
 
 # CASSANDRA SETUP
-lb_policy = DCAwareRoundRobinPolicy(local_dc="us-east-2")
+# lb_policy = DCAwareRoundRobinPolicy(local_dc="us-east-2")
 
-profile = ExecutionProfile(
-    load_balancing_policy=lb_policy,
-)
+# profile = ExecutionProfile(
+#     load_balancing_policy=lb_policy,
+# )
 
-auth_provider = PlainTextAuthProvider(
-    os.getenv("CASSANDRA_DB_USERNAME"), os.getenv("CASSANDRA_DB_PASSWORD")
-)
-cluster = Cluster(
-    cloud={"secure_connect_bundle": os.getenv("CASSANDRA_DB_BUNDLE")},
-    auth_provider=auth_provider,
-    protocol_version=4,
-    execution_profiles={EXEC_PROFILE_DEFAULT: profile},
-)
-session = cluster.connect(os.getenv("CASSANDRA_DB_KEYSPACE"))
+# auth_provider = PlainTextAuthProvider(
+#     os.getenv("CASSANDRA_DB_USERNAME"), os.getenv("CASSANDRA_DB_PASSWORD")
+# )
+# cluster = Cluster(
+#     cloud={"secure_connect_bundle": os.getenv("CASSANDRA_DB_BUNDLE")},
+#     auth_provider=auth_provider,
+#     protocol_version=4,
+#     execution_profiles={EXEC_PROFILE_DEFAULT: profile},
+# )
+# session = cluster.connect(os.getenv("CASSANDRA_DB_KEYSPACE"))
 
-SELECT_STMT = session.prepare(
-    "SELECT bucket, ranking_score, latest_activity, post_id FROM newsfeed_index WHERE post_id = ? ALLOW FILTERING"
-)
-DELETE_STMT = session.prepare(
-    "DELETE FROM newsfeed_index WHERE bucket=? AND ranking_score=? AND latest_activity=? AND post_id=?"
-)
-INSERT_STMT = session.prepare(
-    "INSERT INTO newsfeed_index (bucket, ranking_score, latest_activity, post_id, author_id) VALUES (?, ?, ?, ?, ?)"
-)
+# SELECT_STMT = session.prepare(
+#     "SELECT bucket, ranking_score, latest_activity, post_id FROM newsfeed_index WHERE post_id = ? ALLOW FILTERING"
+# )
+# DELETE_STMT = session.prepare(
+#     "DELETE FROM newsfeed_index WHERE bucket=? AND ranking_score=? AND latest_activity=? AND post_id=?"
+# )
+# INSERT_STMT = session.prepare(
+#     "INSERT INTO newsfeed_index (bucket, ranking_score, latest_activity, post_id, author_id) VALUES (?, ?, ?, ?, ?)"
+# )
 
 # END: CASSANDRA SETUP
 
 # REDIS SETUP
 
-redis_client = redis.Redis(
-    host=os.getenv("REDIS_HOST", "localhost"),
-    port=int(os.getenv("REDIS_PORT", 6379)),
-    username=os.getenv("REDIS_USERNAME"),
-    password=os.getenv("REDIS_PASSWORD"),
-    db=0,
-    decode_responses=True,
-)
+# redis_client = redis.Redis(
+#     host=os.getenv("REDIS_HOST", "localhost"),
+#     port=int(os.getenv("REDIS_PORT", 6379)),
+#     username=os.getenv("REDIS_USERNAME"),
+#     password=os.getenv("REDIS_PASSWORD"),
+#     db=0,
+#     decode_responses=True,
+# )
 
 # END: REDIS SETUP
 
@@ -167,14 +168,14 @@ def process_exact_batch(post_ids):
 
             # --- CASSANDRA PRE-FETCH ---
             # Get old keys for all 100 posts at once to avoid N+1
-            cass_results = execute_concurrent_with_args(
-                session, SELECT_STMT, [[str(r["post_id"])] for r in rows]
-            )
-            cass_lookup = {
-                r.one().post_id: r.one()
-                for success, r in cass_results
-                if success and r.one()
-            }
+            # cass_results = execute_concurrent_with_args(
+            #     session, SELECT_STMT, [[str(r["post_id"])] for r in rows]
+            # )
+            # cass_lookup = {
+            #     r.one().post_id: r.one()
+            #     for success, r in cass_results
+            #     if success and r.one()
+            # }
 
             cass_deletes = []
             cass_inserts = []
@@ -234,46 +235,46 @@ def process_exact_batch(post_ids):
                     )
 
                 # --- CASSANDRA SYNC LOGIC ---
-                pid_str = str(row["post_id"])
-                author_id = str(row["author_id"])
-                old_index = cass_lookup.get(pid_str)
+                # pid_str = str(row["post_id"])
+                # author_id = str(row["author_id"])
+                # old_index = cass_lookup.get(pid_str)
 
-                post_lock_key = f"chatterloop:active_ranking_update_{pid_str}"
+                # post_lock_key = f"chatterloop:active_ranking_update_{pid_str}"
 
-                # Attempt to lock
-                if not redis_client.set(post_lock_key, "locked", ex=30, nx=True):
-                    logger.info(f"  Skipping {pid_str[:8]}: Being updated elsewhere.")
-                    continue
+                # # Attempt to lock
+                # if not redis_client.set(post_lock_key, "locked", ex=30, nx=True):
+                #     logger.info(f"  Skipping {pid_str[:8]}: Being updated elsewhere.")
+                #     continue
 
                 # Add to our "to be unlocked later" list
-                locked_keys.append(post_lock_key)
+                # locked_keys.append(post_lock_key)
 
-                if old_index:
-                    cass_deletes.append(
-                        (
-                            old_index.bucket,
-                            old_index.ranking_score,
-                            old_index.latest_activity,
-                            old_index.post_id,
-                        )
-                    )
+                # if old_index:
+                #     cass_deletes.append(
+                #         (
+                #             old_index.bucket,
+                #             old_index.ranking_score,
+                #             old_index.latest_activity,
+                #             old_index.post_id,
+                #         )
+                #     )
 
-                cass_inserts.append(
-                    (author_id, ranking_score, now_utc, pid_str, author_id)
-                )
+                # cass_inserts.append(
+                #     (author_id, ranking_score, now_utc, pid_str, author_id)
+                # )
 
-                updates.append((post_id, ranking_score, 1))
+                # updates.append((post_id, ranking_score, 1))
 
             # --- EXECUTE CASSANDRA SYNC ---
-            try:
-                if cass_deletes:
-                    execute_concurrent_with_args(session, DELETE_STMT, cass_deletes)
-                if cass_inserts:
-                    execute_concurrent_with_args(session, INSERT_STMT, cass_inserts)
-            finally:
-                # UNLOCK ALL at once after the database work is actually done
-                if locked_keys:
-                    redis_client.delete(*locked_keys)
+            # try:
+            #     if cass_deletes:
+            #         execute_concurrent_with_args(session, DELETE_STMT, cass_deletes)
+            #     if cass_inserts:
+            #         execute_concurrent_with_args(session, INSERT_STMT, cass_inserts)
+            # finally:
+            #     # UNLOCK ALL at once after the database work is actually done
+            #     if locked_keys:
+            #         redis_client.delete(*locked_keys)
 
             # Atomic batch update - ONLY specified fields
             execute_values(
