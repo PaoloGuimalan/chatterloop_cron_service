@@ -145,7 +145,7 @@ def process_exact_batch(post_ids):
                 """
                 SELECT 
                     p.post_id, p.date_posted,
-                    COALESCE(p.author_realm_id, p.user_id) as author_id,
+                    p.entity_id as author_id,
                     COALESCE(ps.likes_count, 0) as likes,
                     COALESCE(ps.comments_count, 0) as comments,
                     COALESCE(ps.shares_count, 0) as shares,
